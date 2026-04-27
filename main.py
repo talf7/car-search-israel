@@ -360,10 +360,13 @@ class App(ctk.CTk):
             return
 
         price = get_inspection_price(kvuzat_agra_cd, hanaa_nm, merkav)
-        self.price_label.configure(
-            text=fmt_price(price) if price else T_UNKNOWN_COST,
-            text_color="#4CAF50" if price else "orange"
-        )
+        if is_price_check_warning(merkav, mispar_moshavim):
+            self.price_label.configure(text="", text_color="#4CAF50")
+        else:
+            self.price_label.configure(
+                text=fmt_price(price) if price else T_UNKNOWN_COST,
+                text_color="#4CAF50" if price else "orange"
+            )
         self.group_label.configure(
             text=fmt_group(kvuzat_agra_cd) if kvuzat_agra_cd else T_GRP_UNKNOWN
         )
