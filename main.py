@@ -54,8 +54,8 @@ def fmt_drive(val):
 def fmt_battery(label_rev, price):
     return f"₪ {price:,}   :{label_rev}"          # → בדיקת סוללה לרכב חשמלי:   450 ₪
 
-# sug_degem translation: REG uses "P"=פרטי (private), "M"=מסחרי (commercial)
-_DEGEM_LABEL = {"P": "פרטי", "M": "מסחרי", "L": "אופנוע", "T": "טרקטור", "O": "נגרר"}
+# sug_degem translation: WLTP uses "M"=נוסעים (M-category passenger), "N"=מסחרי (N-category commercial)
+_DEGEM_LABEL = {"M": "נוסעים", "N": "מסחרי", "L": "אופנוע", "T": "טרקטור", "O": "נגרר"}
 
 def fmt_rechev(val):
     label = _DEGEM_LABEL.get(str(val or "").strip().upper(), str(val or ""))
@@ -116,23 +116,39 @@ def fetch_vehicle_data(plate_number):
     reg = reg_records[0]
 
     sug_delek     = reg.get("sug_delek_nm", "") or ""
-    sug_degem_reg = reg.get("sug_degem",    "") or ""  # "P"=פרטי, "M"=מסחרי (authoritative)
+    sug_degem_reg = reg.get("sug_degem",    "") or ""  # REG: "P"=בעלות פרטית, "M"=בעלות חברה (ownership, NOT vehicle type)
 
-    tozeret_cd = reg.get("tozeret_cd")
-    degem_nm   = reg.get("degem_nm")
+    tozeret_cd  = reg.get("tozeret_cd")
+    degem_nm    = reg.get("degem_nm")
+    shnat_yitzur = reg.get("shnat_yitzur")
+    ramat_gimur  = reg.get("ramat_gimur")
+
     if tozeret_cd and degem_nm:
+        # Try progressively broader filters until a unique match is found
+        filter_candidates = []
+        if shnat_yitzur and ramat_gimur:
+            filter_candidates.append({"tozeret_cd": tozeret_cd, "degem_nm": degem_nm,
+                                       "shnat_yitzur": shnat_yitzur, "ramat_gimur": ramat_gimur})
+        if shnat_yitzur:
+            filter_candidates.append({"tozeret_cd": tozeret_cd, "degem_nm": degem_nm,
+                                       "shnat_yitzur": shnat_yitzur})
+        filter_candidates.append({"tozeret_cd": tozeret_cd, "degem_nm": degem_nm})
+
         try:
-            r2 = _session.get(API_BASE, params={
-                "resource_id": RESOURCE_WLTP,
-                "filters": json.dumps({"tozeret_cd": tozeret_cd, "degem_nm": degem_nm}),
-                "limit": 1,
-            }, timeout=10)
-            r2.raise_for_status()
-            recs = r2.json().get("result", {}).get("records", [])
-            if recs:
-                result = dict(recs[0])          # includes mispar_moshavim, merkav, hanaa_nm…
+            for flt in filter_candidates:
+                r2 = _session.get(API_BASE, params={
+                    "resource_id": RESOURCE_WLTP,
+                    "filters": json.dumps(flt),
+                    "limit": 10,
+                }, timeout=10)
+                r2.raise_for_status()
+                recs = r2.json().get("result", {}).get("records", [])
+                if not recs:
+                    continue
+                # Use first record; if all records agree on key fields use any of them
+                result = dict(recs[0])
                 result["sug_delek_nm"] = sug_delek
-                result["sug_degem"]    = sug_degem_reg  # override with REG (authoritative)
+                # Keep WLTP sug_degem (M=נוסעים, N=מסחרי) — don't override with REG ownership code
                 return result, "ok"
         except Exception:
             pass
@@ -143,11 +159,11 @@ def fetch_vehicle_data(plate_number):
 # ── Price / warning logic ─────────────────────────────────────────────────────
 def is_commercial_vehicle(merkav, sug_degem):
     """True if vehicle is commercial → suppress price, show warning.
-    REG sug_degem: "M"=מסחרי (177K vehicles), "P"=פרטי (3.9M vehicles).
-    Also check merkav for "מסחרי" keyword."""
+    WLTP sug_degem: "N"=מסחרי (N-category), "M"=נוסעים (M-category, passenger).
+    REG sug_degem "M" means company-owned — NOT commercial vehicle type, so ignored here."""
     if "מסחרי" in str(merkav or ""):
         return True
-    if str(sug_degem or "").strip().upper() == "M":
+    if str(sug_degem or "").strip().upper() == "N":
         return True
     return False
 
