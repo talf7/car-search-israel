@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-# VERSION 10 - sug_degem from REG (M=מסחרי, P=פרטי), fix commercial detection, Hebrew labels
+# VERSION 11 - exact WLTP variant match via degem_cd, kvuzat_agra fallback from REG,
+#              case-insensitive 4X4 detection (mirrors the dynamometer.co.il lookup)
 import customtkinter as ctk
 import requests
 import threading
@@ -34,6 +35,8 @@ T_INVALID         = "ספרות 8 עד 5 — תקין לא רישוי מספר"
 T_ENTER           = "רישוי מספר להכניס נא"
 T_GRP_UNKNOWN     = "ידועה לא :אגרה קבוצת"          # → קבוצת אגרה: לא ידועה
 T_DRV_UNKNOWN     = "ידוע לא :הנעה סוג"             # → סוג הנעה: לא ידוע
+T_PARTIAL         = "זה לדגם זמינים אינם מלאים טכניים נתונים"
+# → נתונים טכניים מלאים אינם זמינים לדגם זה
 # Warning strings (stored reversed for bidi)
 T_COMMERCIAL_WARN = "מדוייק מחיר לברר צריך לכן מסחרי הינו הרכב"
 # → הרכב הינו מסחרי לכן צריך לברר מחיר מדוייק
@@ -103,6 +106,73 @@ def _create_car_icon():
 
 
 # ── API ───────────────────────────────────────────────────────────────────────
+def _has_value(val):
+    """True if a record field carries a usable filter value (0 counts as valid)."""
+    return val is not None and str(val).strip() != ""
+
+
+def _fetch_wltp_by_filters(filters):
+    r = _session.get(API_BASE, params={
+        "resource_id": RESOURCE_WLTP,
+        "filters": json.dumps(filters),
+        "limit": 1,
+    }, timeout=10)
+    r.raise_for_status()
+    recs = r.json().get("result", {}).get("records", [])
+    return recs[0] if recs else None
+
+
+def fetch_wltp_record(reg):
+    """Find the WLTP row for this vehicle's *exact* variant.
+
+    The WLTP resource holds MANY rows per (tozeret_cd, degem_nm) — one per
+    trim/drive/year variant, differing in hanaa_nm (4X2 vs 4X4), kvuzat_agra_cd,
+    koah_sus, etc. Filtering on (tozeret_cd, degem_nm) alone returns an arbitrary
+    variant, which is what produced wrong drive types, wrong licence-fee groups
+    and therefore wrong prices. The registration record carries `degem_cd` — the
+    exact variant code, mapping 1:1 to the WLTP row — plus shnat_yitzur /
+    ramat_gimur, which pin the correct variant down.
+
+    Filter on the fullest discriminating key set available, then DEGRADE
+    GRACEFULLY: this dataset has gaps, so a strict filter returning 0 rows
+    retries with progressively fewer filters. `degem_cd` is the strongest key
+    and is dropped last; the softer trim/year filters are relaxed first.
+    """
+    if not (_has_value(reg.get("tozeret_cd")) and _has_value(reg.get("degem_nm"))):
+        return None
+
+    base = {"tozeret_cd": reg["tozeret_cd"], "degem_nm": reg["degem_nm"]}
+    # Only include filters the reg record actually carries — filtering on an
+    # empty value matches nothing.
+    degem_cd = {"degem_cd": reg["degem_cd"]} if _has_value(reg.get("degem_cd")) else {}
+    year = {"shnat_yitzur": reg["shnat_yitzur"]} if _has_value(reg.get("shnat_yitzur")) else {}
+    trim = {"ramat_gimur": reg["ramat_gimur"]} if _has_value(reg.get("ramat_gimur")) else {}
+
+    # Ordered strictest → loosest; each entry is the extra filters on top of base.
+    attempts = [
+        {**degem_cd, **year, **trim},
+        {**degem_cd, **year},
+        {**degem_cd},
+        {},  # last resort: (tozeret_cd, degem_nm) only
+    ]
+
+    # De-dupe identical filter sets (e.g. when degem_cd/year are absent).
+    seen = set()
+    for extra in attempts:
+        filters = {**base, **extra}
+        key = json.dumps(filters, sort_keys=True, ensure_ascii=False)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            rec = _fetch_wltp_by_filters(filters)
+            if rec:
+                return rec
+        except Exception:
+            pass  # network/parse failure on one attempt — fall through to a looser filter
+    return None
+
+
 def fetch_vehicle_data(plate_number):
     r1 = _session.get(API_BASE, params={
         "resource_id": RESOURCE_REG,
@@ -115,45 +185,34 @@ def fetch_vehicle_data(plate_number):
         return None, "not_found"
     reg = reg_records[0]
 
-    sug_delek     = reg.get("sug_delek_nm", "") or ""
-    sug_degem_reg = reg.get("sug_degem",    "") or ""  # REG: "P"=בעלות פרטית, "M"=בעלות חברה (ownership, NOT vehicle type)
+    sug_delek = reg.get("sug_delek_nm", "") or ""
 
-    tozeret_cd  = reg.get("tozeret_cd")
-    degem_nm    = reg.get("degem_nm")
-    shnat_yitzur = reg.get("shnat_yitzur")
-    ramat_gimur  = reg.get("ramat_gimur")
+    # Licence-fee group as carried by the registration record — used as a
+    # fallback when the WLTP row is missing or omits it. The dataset spells it
+    # both ways, so accept either.
+    reg_agra = next(
+        (reg.get(k) for k in ("kvutzat_agra", "kvuzat_agra_cd") if _has_value(reg.get(k))),
+        None,
+    )
 
-    if tozeret_cd and degem_nm:
-        # Try progressively broader filters until a unique match is found
-        filter_candidates = []
-        if shnat_yitzur and ramat_gimur:
-            filter_candidates.append({"tozeret_cd": tozeret_cd, "degem_nm": degem_nm,
-                                       "shnat_yitzur": shnat_yitzur, "ramat_gimur": ramat_gimur})
-        if shnat_yitzur:
-            filter_candidates.append({"tozeret_cd": tozeret_cd, "degem_nm": degem_nm,
-                                       "shnat_yitzur": shnat_yitzur})
-        filter_candidates.append({"tozeret_cd": tozeret_cd, "degem_nm": degem_nm})
+    wltp = fetch_wltp_record(reg)
+    if wltp:
+        result = dict(wltp)
+        result["sug_delek_nm"] = sug_delek
+        # Keep WLTP sug_degem (M=נוסעים, N=מסחרי) — never override it with REG's
+        # sug_degem, which is an OWNERSHIP code (P=פרטית, M=חברה), not a category.
+        if not _has_value(result.get("kvuzat_agra_cd")) and reg_agra is not None:
+            result["kvuzat_agra_cd"] = reg_agra
+        return result, "ok"
 
-        try:
-            for flt in filter_candidates:
-                r2 = _session.get(API_BASE, params={
-                    "resource_id": RESOURCE_WLTP,
-                    "filters": json.dumps(flt),
-                    "limit": 10,
-                }, timeout=10)
-                r2.raise_for_status()
-                recs = r2.json().get("result", {}).get("records", [])
-                if not recs:
-                    continue
-                # Use first record; if all records agree on key fields use any of them
-                result = dict(recs[0])
-                result["sug_delek_nm"] = sug_delek
-                # Keep WLTP sug_degem (M=נוסעים, N=מסחרי) — don't override with REG ownership code
-                return result, "ok"
-        except Exception:
-            pass
+    # No WLTP variant matched. The fee group from REG is still enough for a
+    # price estimate. REG's sug_degem is deliberately NOT passed through: it
+    # encodes ownership, and feeding it to the commercial check would flag every
+    # company-owned car as a commercial vehicle.
+    if reg_agra is not None:
+        return {"sug_delek_nm": sug_delek, "kvuzat_agra_cd": reg_agra}, "partial"
 
-    return {"sug_delek_nm": sug_delek, "sug_degem": sug_degem_reg}, "no_wltp"
+    return {"sug_delek_nm": sug_delek}, "no_wltp"
 
 
 # ── Price / warning logic ─────────────────────────────────────────────────────
@@ -189,7 +248,7 @@ def get_inspection_price(kvuzat_agra_cd, hanaa_nm, merkav):
         return None
     if not group:
         return None
-    is_4x4  = hanaa_nm == "4X4"
+    is_4x4  = str(hanaa_nm or "").strip().upper() == "4X4"
     is_mini = merkav and "מיני" in str(merkav)
     if is_4x4:
         if group <= 3: return 860
@@ -346,6 +405,29 @@ class App(ctk.CTk):
             self._show_battery((data or {}).get("sug_delek_nm", ""))
             self.results_frame.pack_forget()
             self.warning_frame.pack_forget()
+            return
+
+        if status == "partial":
+            # No WLTP variant matched, but REG gave us the licence-fee group —
+            # enough for a price. Drive type / body / seats stay unknown, so the
+            # 4X4 and mini tiers can't apply and the commercial check can't run.
+            kvuzat_agra_cd = data.get("kvuzat_agra_cd")
+            price = get_inspection_price(kvuzat_agra_cd, "", "")
+            self.price_label.configure(
+                text=fmt_price(price) if price else T_UNKNOWN_COST,
+                text_color="#4CAF50" if price else "orange",
+            )
+            self.group_label.configure(
+                text=fmt_group(kvuzat_agra_cd) if kvuzat_agra_cd else T_GRP_UNKNOWN
+            )
+            self.drive_label.configure(text=T_DRV_UNKNOWN)
+            self.rechev_label.configure(text="")
+            self.merkav_label.configure(text="")
+            self.moshavim_label.configure(text="")
+            self._set_status(T_PARTIAL, "orange")
+            self.warning_frame.pack_forget()
+            self.results_frame.pack(pady=14, padx=40, fill="x")
+            self._show_battery(data.get("sug_delek_nm", ""))
             return
 
         kvuzat_agra_cd  = data.get("kvuzat_agra_cd")
