@@ -137,9 +137,15 @@ def fetch_wltp_record(reg):
     GRACEFULLY: this dataset has gaps, so a strict filter returning 0 rows
     retries with progressively fewer filters. `degem_cd` is the strongest key
     and is dropped last; the softer trim/year filters are relaxed first.
+
+    Returns (record, exact) where `exact` is True only if the winning filter
+    included degem_cd. When it is False the row is whatever variant the dataset
+    returned first, so its hanaa_nm / kvuzat_agra_cd — and therefore the price —
+    may belong to a different version of the car, and the caller must say so
+    rather than present the price as final.
     """
     if not (_has_value(reg.get("tozeret_cd")) and _has_value(reg.get("degem_nm"))):
-        return None
+        return None, False
 
     base = {"tozeret_cd": reg["tozeret_cd"], "degem_nm": reg["degem_nm"]}
     # Only include filters the reg record actually carries — filtering on an
@@ -167,10 +173,10 @@ def fetch_wltp_record(reg):
         try:
             rec = _fetch_wltp_by_filters(filters)
             if rec:
-                return rec
+                return rec, "degem_cd" in filters
         except Exception:
             pass  # network/parse failure on one attempt — fall through to a looser filter
-    return None
+    return None, False
 
 
 def fetch_vehicle_data(plate_number):
@@ -195,7 +201,7 @@ def fetch_vehicle_data(plate_number):
         None,
     )
 
-    wltp = fetch_wltp_record(reg)
+    wltp, exact = fetch_wltp_record(reg)
     if wltp:
         result = dict(wltp)
         result["sug_delek_nm"] = sug_delek
@@ -203,6 +209,8 @@ def fetch_vehicle_data(plate_number):
         # sug_degem, which is an OWNERSHIP code (P=פרטית, M=חברה), not a category.
         if not _has_value(result.get("kvuzat_agra_cd")) and reg_agra is not None:
             result["kvuzat_agra_cd"] = reg_agra
+        # Underscore-prefixed so it can't collide with a datastore field name.
+        result["_variant_exact"] = exact
         return result, "ok"
 
     # No WLTP variant matched. The fee group from REG is still enough for a
@@ -227,25 +235,30 @@ def is_commercial_vehicle(merkav, sug_degem):
     return False
 
 
+def _to_int(val):
+    """Parse a datastore numeric field. Values arrive as int, float or string
+    ("3", "3.0", " 3 ") depending on the record — a bare int() chokes on "3.0"
+    and would silently drop the price. Returns None if unparseable."""
+    if val is None:
+        return None
+    try:
+        return int(float(str(val).strip()))
+    except (ValueError, TypeError):
+        return None
+
+
 def is_price_check_warning(merkav, mispar_moshavim):
     """True if MPV/אחוד body, or 6+ passenger seats (excl. driver)."""
     if "MPV" in str(merkav or "").upper() or "אחוד" in str(merkav or ""):
         return True
-    try:
-        if int(mispar_moshavim or 0) - 1 >= 6:
-            return True
-    except (ValueError, TypeError):
-        pass
+    seats = _to_int(mispar_moshavim)
+    if seats is not None and seats - 1 >= 6:
+        return True
     return False
 
 
 def get_inspection_price(kvuzat_agra_cd, hanaa_nm, merkav):
-    if not kvuzat_agra_cd:
-        return None
-    try:
-        group = int(kvuzat_agra_cd)
-    except (ValueError, TypeError):
-        return None
+    group = _to_int(kvuzat_agra_cd)
     if not group:
         return None
     is_4x4  = str(hanaa_nm or "").strip().upper() == "4X4"
@@ -425,7 +438,10 @@ class App(ctk.CTk):
             self.merkav_label.configure(text="")
             self.moshavim_label.configure(text="")
             self._set_status(T_PARTIAL, "orange")
-            self.warning_frame.pack_forget()
+            # Drive type and body are unknown here, so the 4X4 and mini tiers
+            # cannot be ruled out — the figure above is a floor, not a quote.
+            self.warning_label.configure(text=T_PRICE_CHECK)
+            self.warning_frame.pack(pady=(0, 8), padx=40, fill="x")
             self.results_frame.pack(pady=14, padx=40, fill="x")
             self._show_battery(data.get("sug_delek_nm", ""))
             return
@@ -460,6 +476,14 @@ class App(ctk.CTk):
         price = get_inspection_price(kvuzat_agra_cd, hanaa_nm, merkav)
         if is_price_check_warning(merkav, mispar_moshavim):
             self.price_label.configure(text="", text_color="#4CAF50")
+        elif not data.get("_variant_exact", False):
+            # degem_cd didn't pin the variant down, so hanaa_nm / kvuzat_agra_cd
+            # here may come from a different version of this model. Show the
+            # figure, but never as a final price.
+            self.price_label.configure(
+                text=fmt_price(price) if price else T_UNKNOWN_COST,
+                text_color="#4CAF50" if price else "orange"
+            )
         else:
             self.price_label.configure(
                 text=fmt_price(price) if price else T_UNKNOWN_COST,
@@ -472,12 +496,14 @@ class App(ctk.CTk):
             text=fmt_drive(hanaa_nm) if hanaa_nm else T_DRV_UNKNOWN
         )
         self._set_status("", "gray")
-        self._show_warning(merkav, mispar_moshavim)
+        self._show_warning(merkav, mispar_moshavim, data.get("_variant_exact", False))
         self.results_frame.pack(pady=14, padx=40, fill="x")
         self._show_battery(sug_delek)
 
-    def _show_warning(self, merkav, mispar_moshavim):
-        if is_price_check_warning(merkav, mispar_moshavim):
+    def _show_warning(self, merkav, mispar_moshavim, variant_exact=True):
+        # Warn when the price needs confirming: an MPV/many-seat body, or a WLTP
+        # row that degem_cd could not pin to this exact variant.
+        if is_price_check_warning(merkav, mispar_moshavim) or not variant_exact:
             self.warning_label.configure(text=T_PRICE_CHECK)
             self.warning_frame.pack(pady=(0, 8), padx=40, fill="x")
         else:
